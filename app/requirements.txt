@@ -1,0 +1,10 @@
+﻿
+google-genai==2.25.0
+pandas==3.0.6
+pycountry==26.2.16
+python-dotenv==1.2.3
+pytrends==4.9.2
+requests==2.34.2
+streamlit==1.64.0
+
+

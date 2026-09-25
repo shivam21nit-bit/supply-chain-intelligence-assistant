@@ -1,0 +1,10 @@
+# Secrets — every slice's .env holds real API keys/credentials, never commit these.
+.env
+.env.*
+
+venv/
+__pycache__/
+*.pyc
+
+# Generated chart images from the CLI scripts (not source, regenerated on each run).
+*.png
