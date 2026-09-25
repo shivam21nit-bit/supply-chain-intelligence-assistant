@@ -1,5 +1,8 @@
 ﻿
+absl-py==2.5.0
+immutabledict==4.3.1
+ortools==9.15.6755
 pandas==3.0.6
-PuLP==2.9.0
+protobuf==6.33.6
 
 

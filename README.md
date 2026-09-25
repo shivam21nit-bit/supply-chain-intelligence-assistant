@@ -47,7 +47,9 @@ instead of all at once, so there's always something real to test and react to.
 5. **Network Optimization Engine** — DONE (see `network_optimizer/` +
    app tab 4). A different kind of capability from 1-4: not sensing, but
    an actual cost-minimizing multi-period transportation-problem solver
-   (PuLP/CBC) — given a whole network's lanes (cost, lead time, capacity)
+   (Google OR-Tools' GLOP LP solver — swapped in from an initial PuLP/CBC
+   build once we discussed solver choice; see the constraint note below)
+   — given a whole network's lanes (cost, lead time, capacity)
    and weekly demand, computes the cheapest real shipment plan, uploaded
    via CSV or entered manually. Its own SQLite store, deliberately
    separate from slice 3's Neo4j graph (this data is tabular/time-indexed,
@@ -114,9 +116,10 @@ instead of all at once, so there's always something real to test and react to.
   ```
   No CLI wizard for this one (it's tabular data, best driven from the
   app's Tab 4 or a CSV) — `store.py` (SQLite, `network.db`, git-ignored)
-  and `optimizer.py` (the PuLP LP model) are the two files, both
+  and `optimizer.py` (the OR-Tools/GLOP LP model) are the two files, both
   independently unit-tested against hand-calculated expected answers
-  before being wired into the UI. Needs `pulp==2.9.0` pinned explicitly —
+  before being wired into the UI (re-verified again after the PuLP→
+  OR-Tools swap — same test cases, same answers). Needs `ortools` —
   see the constraint note below.
 
 ## Notes / constraints
@@ -172,11 +175,17 @@ instead of all at once, so there's always something real to test and react to.
   PortWatch's transit-volume figures are the only numbers the LLM is
   allowed to cite for price/delay — it's explicitly instructed never to
   invent a specific number that isn't literally present in what it's given.
-- **`network_optimizer` requires `pulp==2.9.0` specifically** — PuLP 4.0
-  (the current default `pip install pulp`) rewrote its internals around a
-  new Rust core and broke the classic `LpVariable(lowBound=..., upBound=...)`
-  API this code (and most PuLP tutorials/documentation) is written
-  against. Pin the version; don't blindly upgrade.
+- **Solver history**: started on PuLP/CBC (hit a real breaking change —
+  PuLP's now-default v4.0 rewrote its internals around a new Rust core
+  and dropped the classic `LpVariable(lowBound=..., upBound=...)` API,
+  so we'd pinned `pulp==2.9.0`). Swapped to **Google OR-Tools' GLOP**
+  solver after discussing solver choice — GLOP is the right OR-Tools
+  backend for this specific model because it's a pure continuous LP
+  (no integer/MIP variables); if minimum order quantities or
+  lane-activation fixed costs get added later, that's a real switch to
+  OR-Tools' CP-SAT solver, not a config flag. Both solvers gave
+  identical answers on the same hand-verified test cases before/after
+  the swap.
 - The optimizer models inventory carrying forward between weeks with
   **no holding cost** (a stated simplification — no data was available
   for it). One real consequence, verified while testing: with holding
