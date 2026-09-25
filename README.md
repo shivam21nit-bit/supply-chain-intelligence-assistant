@@ -44,6 +44,18 @@ instead of all at once, so there's always something real to test and react to.
    section cross-checks each modeled route against real trade data
    (international routes) or news-based leads (domestic routes), since
    those two cases have genuinely different free data available.
+5. **Network Optimization Engine** — DONE (see `network_optimizer/` +
+   app tab 4). A different kind of capability from 1-4: not sensing, but
+   an actual cost-minimizing multi-period transportation-problem solver
+   (PuLP/CBC) — given a whole network's lanes (cost, lead time, capacity)
+   and weekly demand, computes the cheapest real shipment plan, uploaded
+   via CSV or entered manually. Its own SQLite store, deliberately
+   separate from slice 3's Neo4j graph (this data is tabular/time-indexed,
+   not graph-shaped) — but kept in sync with it, one button-click action
+   at a time, not automatically: reuse graph location/item names when
+   entering optimizer data, import an existing graph route as a lane
+   skeleton, and write the optimizer's actual-used lanes back to the
+   graph as routes after a run.
 
 ## Project layout
 
@@ -94,6 +106,18 @@ instead of all at once, so there's always something real to test and react to.
   `disruption_feed/.env`'s existing `UNCOMTRADE_API_KEY` for the route
   analysis section, and the free `pycountry` package (offline, no API) to
   resolve free-text country names to ISO3 codes.
+
+- `network_optimizer/` — slice 5, also usable standalone for testing:
+  ```
+  cd network_optimizer
+  .\venv\Scripts\python.exe -c "import store; print(store.get_all_lanes())"
+  ```
+  No CLI wizard for this one (it's tabular data, best driven from the
+  app's Tab 4 or a CSV) — `store.py` (SQLite, `network.db`, git-ignored)
+  and `optimizer.py` (the PuLP LP model) are the two files, both
+  independently unit-tested against hand-calculated expected answers
+  before being wired into the UI. Needs `pulp==2.9.0` pinned explicitly —
+  see the constraint note below.
 
 ## Notes / constraints
 
@@ -148,3 +172,22 @@ instead of all at once, so there's always something real to test and react to.
   PortWatch's transit-volume figures are the only numbers the LLM is
   allowed to cite for price/delay — it's explicitly instructed never to
   invent a specific number that isn't literally present in what it's given.
+- **`network_optimizer` requires `pulp==2.9.0` specifically** — PuLP 4.0
+  (the current default `pip install pulp`) rewrote its internals around a
+  new Rust core and broke the classic `LpVariable(lowBound=..., upBound=...)`
+  API this code (and most PuLP tutorials/documentation) is written
+  against. Pin the version; don't blindly upgrade.
+- The optimizer models inventory carrying forward between weeks with
+  **no holding cost** (a stated simplification — no data was available
+  for it). One real consequence, verified while testing: with holding
+  free, the solver can be mathematically indifferent between several
+  equally-cheap timings, so it may report a whole shortfall under one
+  specific week, or ship everything early and hold it, rather than the
+  "natural"-looking spread a human might expect. The *totals* (total
+  cost, total unmet quantity, per-lane utilization) are always
+  meaningful; the exact week-by-week split isn't guaranteed to be unique.
+- Capacity in `network_optimizer` is flat per lane (same number every
+  week) and the stockout penalty is one global number, not per item/
+  location — both stated simplifications matching the data you have
+  today, documented as future enhancements in the plan rather than
+  silently assumed.

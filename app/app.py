@@ -19,7 +19,7 @@ import streamlit as st
 
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 PROJECT_DIR = os.path.dirname(APP_DIR)
-for sibling in ["supply_chain_graph", "disruption_feed", "demand_signal"]:
+for sibling in ["supply_chain_graph", "disruption_feed", "demand_signal", "network_optimizer"]:
     sys.path.insert(0, os.path.join(PROJECT_DIR, sibling))
 
 from graph_store import NODE_TYPES, add_edge, add_node, delete_edge, delete_node, get_all_edges, get_all_nodes  # noqa: E402
@@ -34,6 +34,9 @@ from trade_data import get_top_import_sources  # noqa: E402
 
 from llm_summary import summarize_cause  # noqa: E402
 from country_lookup import resolve_iso3  # noqa: E402
+
+import store as netopt_store  # noqa: E402
+from optimizer import solve as solve_network, InfeasibleError  # noqa: E402
 
 MODES = ["sea", "air", "road", "rail"]
 
@@ -174,11 +177,27 @@ def build_graph_dot(nodes: list[dict], edges: list[dict]) -> str:
     return "\n".join(lines)
 
 
+_NEW_NAME_OPTION = "+ New..."
+
+
+def name_or_new_input(label: str, existing_options: list[str], key: str) -> str:
+    """A selectbox of existing names (e.g. from the Neo4j graph) plus a
+    '+ New...' option that reveals a text input — reuses names already
+    modeled elsewhere in the app instead of risking a retyped variant
+    ('India' vs 'india'), while still allowing a genuinely new name.
+    Must be used OUTSIDE an st.form: forms only rerun on submit, so a
+    conditional widget inside one wouldn't appear until then."""
+    choice = st.selectbox(label, existing_options + [_NEW_NAME_OPTION], key=f"{key}_select")
+    if choice == _NEW_NAME_OPTION:
+        return st.text_input(f"New {label.lower()}", key=f"{key}_new")
+    return choice
+
+
 st.set_page_config(page_title="Supply Chain Intelligence Assistant", layout="wide")
 st.title("Supply Chain Intelligence Assistant")
 
-tab_graph, tab_demand, tab_disruption = st.tabs(
-    ["My Supply Chain", "Demand Lookup", "Disruption Scan"]
+tab_graph, tab_demand, tab_disruption, tab_optimizer = st.tabs(
+    ["My Supply Chain", "Demand Lookup", "Disruption Scan", "Network Optimizer"]
 )
 
 try:
@@ -501,3 +520,236 @@ with tab_disruption:
                     continue
                 subject = f"'{query}' (relevant supply chain nodes/routes: {', '.join(refs)})"
                 render_articles(articles, key=f"disruption_{i}_{query}", subject=subject, context_lines=context_lines, tag_key="effect")
+
+# --- Tab 4: Network Optimizer ---
+with tab_optimizer:
+    st.subheader("Optimize shipment plan across your full network")
+    st.caption(
+        "A real cost-minimizing multi-period transportation model (not a heuristic or an "
+        "LLM summary) — given lanes (cost, lead time, capacity) and weekly demand, computes "
+        "the cheapest shipment plan, allowing unmet demand at a penalty cost instead of "
+        "treating an under-supplied network as infeasible. Separate from the graph in the "
+        "'My Supply Chain' tab — this is its own data store, sized for larger networks."
+    )
+
+    st.markdown("### 1. Load your network")
+    upload_col1, upload_col2 = st.columns(2)
+
+    with upload_col1:
+        st.markdown(
+            "**Lanes** — `lane_id, from_location, to_location, item, cost_per_unit, "
+            "lead_time_weeks, capacity_per_week`"
+        )
+        lanes_template = pd.DataFrame(columns=[
+            "lane_id", "from_location", "to_location", "item",
+            "cost_per_unit", "lead_time_weeks", "capacity_per_week",
+        ])
+        st.download_button(
+            "Download lanes template", lanes_template.to_csv(index=False),
+            file_name="lanes_template.csv", key="dl_lanes_template",
+        )
+        lanes_upload = st.file_uploader("Upload lanes CSV", type="csv", key="lanes_upload")
+        if lanes_upload is not None:
+            try:
+                n = netopt_store.load_lanes_df(pd.read_csv(lanes_upload))
+            except ValueError as e:
+                st.error(str(e))
+            else:
+                st.success(f"Loaded {n} lane row(s).")
+                st.rerun()
+
+    with upload_col2:
+        st.markdown("**Demand** — `location, item, week, demand_qty`")
+        demand_template = pd.DataFrame(columns=["location", "item", "week", "demand_qty"])
+        st.download_button(
+            "Download demand template", demand_template.to_csv(index=False),
+            file_name="demand_template.csv", key="dl_demand_template",
+        )
+        demand_upload = st.file_uploader("Upload demand CSV", type="csv", key="demand_upload")
+        if demand_upload is not None:
+            try:
+                n = netopt_store.load_demand_df(pd.read_csv(demand_upload))
+            except ValueError as e:
+                st.error(str(e))
+            else:
+                st.success(f"Loaded {n} demand row(s).")
+                st.rerun()
+
+    current_lanes = netopt_store.get_all_lanes()
+    current_demand = netopt_store.get_all_demand()
+    current_inventory = netopt_store.get_starting_inventory()
+
+    st.markdown(f"**Currently loaded:** {len(current_lanes)} lane row(s), {len(current_demand)} demand row(s).")
+    if not current_lanes.empty:
+        st.caption("Lanes")
+        st.dataframe(current_lanes, use_container_width=True)
+    if not current_demand.empty:
+        st.caption("Demand")
+        st.dataframe(current_demand, use_container_width=True)
+
+    graph_location_names = [n["name"] for n in nodes]
+    graph_item_names = sorted({item for n in nodes for item in n["items"]})
+
+    with st.expander("Or add rows manually (for smaller networks)"):
+        st.caption(
+            "Location/item pickers below reuse names already in your 'My Supply Chain' "
+            "graph where possible — pick '+ New...' to type a name that doesn't exist there yet."
+        )
+        st.caption("Add a single lane")
+        lc1, lc2, lc3 = st.columns(3)
+        with lc1:
+            lane_id = st.text_input("Lane ID", key="lane_id_input")
+            from_loc = name_or_new_input("From location", graph_location_names, "lane_from")
+        with lc2:
+            to_loc = name_or_new_input("To location", graph_location_names, "lane_to")
+            lane_item = name_or_new_input("Item", graph_item_names, "lane_item")
+        with lc3:
+            cost = st.number_input("Cost per unit", min_value=0.0, step=0.1, key="lane_cost")
+            lead_time = st.number_input("Lead time (weeks)", min_value=0, step=1, key="lane_leadtime")
+            capacity = st.number_input("Capacity per week", min_value=0.0, step=1.0, key="lane_capacity")
+        if st.button("Add lane"):
+            if not (lane_id and from_loc and to_loc and lane_item):
+                st.error("Lane ID, from/to location, and item are all required.")
+            else:
+                netopt_store.add_lane(lane_id, from_loc, to_loc, lane_item, cost, int(lead_time), capacity)
+                st.success(f"Added lane {lane_id}.")
+                st.rerun()
+
+        st.divider()
+        st.caption("Add a single demand row")
+        dc1, dc2, dc3 = st.columns(3)
+        with dc1:
+            d_loc = name_or_new_input("Location", graph_location_names, "demand_loc")
+        with dc2:
+            d_item = name_or_new_input("Item", graph_item_names, "demand_item")
+        with dc3:
+            d_week = st.number_input("Week", min_value=1, step=1, key="demand_week")
+        d_qty = st.number_input("Demand quantity", min_value=0.0, step=1.0, key="demand_qty")
+        if st.button("Add demand row"):
+            if not (d_loc and d_item):
+                st.error("Location and item are required.")
+            else:
+                netopt_store.add_demand_row(d_loc, d_item, int(d_week), d_qty)
+                st.success("Added demand row.")
+                st.rerun()
+
+    with st.expander("Import a route from my graph"):
+        existing_lane_keys = set(zip(current_lanes.get("from_location", []), current_lanes.get("to_location", []), current_lanes.get("item", [])))
+        importable = [e for e in edges if (e["from_name"], e["to_name"], e["item"]) not in existing_lane_keys]
+        if not importable:
+            st.caption("No new routes to import — every graph route is already a lane, or your graph has none yet.")
+        else:
+            route_labels = [f"{e['from_name']} -> {e['to_name']} ({e['item']}, {e['mode']})" for e in importable]
+            route_choice = st.selectbox("Graph route", route_labels, key="import_route_choice")
+            chosen_edge = importable[route_labels.index(route_choice)]
+            ic1, ic2, ic3 = st.columns(3)
+            with ic1:
+                import_lane_id = st.text_input("Lane ID for this import", value=f"{chosen_edge['from_name']}_{chosen_edge['to_name']}", key="import_lane_id")
+            with ic2:
+                import_cost = st.number_input("Cost per unit", min_value=0.0, step=0.1, key="import_cost")
+                import_leadtime = st.number_input("Lead time (weeks)", min_value=0, step=1, key="import_leadtime")
+            with ic3:
+                import_capacity = st.number_input("Capacity per week", min_value=0.0, step=1.0, key="import_capacity")
+            if st.button("Import this route as a lane"):
+                netopt_store.add_lane(
+                    import_lane_id, chosen_edge["from_name"], chosen_edge["to_name"], chosen_edge["item"],
+                    import_cost, int(import_leadtime), import_capacity,
+                )
+                st.success(f"Imported '{route_choice}' as lane {import_lane_id}.")
+                st.rerun()
+
+    st.divider()
+    st.markdown("### 2. Run the optimization")
+
+    default_penalty = round(current_lanes["cost_per_unit"].mean() * 10, 2) if not current_lanes.empty else 100.0
+    stockout_penalty = st.number_input(
+        "Stockout penalty cost per unmet unit",
+        min_value=0.0, value=default_penalty, step=1.0,
+        help="Cost charged per unit of demand that can't be met. Default shown is 10x your "
+        "average lane cost — override if you have a real figure.",
+    )
+
+    if st.button("Run optimization"):
+        try:
+            result = solve_network(current_lanes, current_demand, current_inventory, stockout_penalty)
+        except ValueError as e:
+            st.error(str(e))
+        except InfeasibleError as e:
+            st.error(f"Solver could not find a solution: {e}")
+        else:
+            # Stashed in session_state (not just a local var) so the "Sync to
+            # graph" button below still has it after the rerun that button click causes.
+            st.session_state["netopt_last_result"] = result
+            st.session_state["netopt_last_lanes"] = current_lanes
+
+    if "netopt_last_result" in st.session_state:
+        result = st.session_state["netopt_last_result"]
+        lanes_used_for_run = st.session_state["netopt_last_lanes"]
+
+        st.success(
+            f"Total cost: {result['total_cost']:,.2f} "
+            f"(shipping: {result['total_shipping_cost']:,.2f}, "
+            f"stockout penalty: {result['total_penalty_cost']:,.2f})"
+        )
+        st.caption(
+            "With no holding cost modeled, the solver can be mathematically indifferent "
+            "between several equally-cheap timings — trust the totals and per-lane "
+            "utilization over the exact week-by-week split of shipments/unmet demand."
+        )
+
+        st.markdown("**Shipment plan**")
+        if not result["shipment_plan"].empty:
+            st.dataframe(result["shipment_plan"], use_container_width=True)
+        else:
+            st.info("No shipments in the optimal plan.")
+
+        st.markdown("**Unmet demand**")
+        if not result["unmet_demand"].empty:
+            st.warning("Some demand could not be met at the given capacity/cost tradeoff — see below.")
+            st.dataframe(result["unmet_demand"], use_container_width=True)
+        else:
+            st.info("All demand was met.")
+
+        st.divider()
+        st.caption(
+            "Writes each lane actually used in this plan back to your 'My Supply Chain' "
+            "graph as a route (tagged 'optimized'), skipping any lane whose location isn't "
+            "already a node there instead of guessing or creating one."
+        )
+        if st.button("Sync optimal plan back to graph"):
+            if result["shipment_plan"].empty:
+                st.info("Nothing to sync — the optimal plan has no shipments.")
+            else:
+                lane_lookup = {(r["lane_id"], r["item"]): r for _, r in lanes_used_for_run.iterrows()}
+                existing_edge_keys = {(e["from_name"], e["to_name"], e["item"]) for e in edges}
+                used = result["shipment_plan"][["lane_id", "item"]].drop_duplicates()
+
+                synced, skipped, already_there = [], [], []
+                for _, row in used.iterrows():
+                    lane_row = lane_lookup.get((row["lane_id"], row["item"]))
+                    if lane_row is None:
+                        continue
+                    from_loc, to_loc, item = lane_row["from_location"], lane_row["to_location"], row["item"]
+                    if (from_loc, to_loc, item) in existing_edge_keys:
+                        already_there.append(row["lane_id"])
+                        continue
+                    util = result["shipment_plan"].loc[
+                        (result["shipment_plan"]["lane_id"] == row["lane_id"])
+                        & (result["shipment_plan"]["item"] == item),
+                        "utilization_pct",
+                    ].mean()
+                    try:
+                        add_edge(from_loc, to_loc, item, "optimized",
+                                  f"From network optimizer (lane {row['lane_id']}, avg utilization {util:.0f}%)")
+                        synced.append(row["lane_id"])
+                    except ValueError:
+                        skipped.append(f"'{row['lane_id']}': '{from_loc}' or '{to_loc}' isn't a node in your graph yet — add it in the 'My Supply Chain' tab first.")
+
+                if synced:
+                    st.success(f"Synced {len(synced)} lane(s) to your graph: {', '.join(synced)}.")
+                if already_there:
+                    st.caption(f"Already present as routes: {', '.join(already_there)}.")
+                for msg in skipped:
+                    st.warning(f"Skipped {msg}")
+                if synced:
+                    st.rerun()
