@@ -46,8 +46,8 @@ MODES = ["sea", "air", "road", "rail"]
 # rate-limited APIs for the exact same query. Failures aren't cached —
 # only successful results — so a transient error still retries live.
 @st.cache_data(ttl=900, show_spinner=False)
-def cached_interest_over_time(item: str, geo: str):
-    return get_interest_over_time(item, geo)
+def cached_interest_over_time(item: str, geo: str, timeframe: str = "today 3-m"):
+    return get_interest_over_time(item, geo, timeframe)
 
 
 @st.cache_data(ttl=900, show_spinner=False)
@@ -404,56 +404,90 @@ with tab_graph:
                 st.write(f"**AI route analysis:** {analysis}")
 
 # --- Tab 2: Demand Lookup ---
+HORIZON_OPTIONS = {"3 months": "today 3-m", "6 months": "today 6-m", "12 months": "today 12-m"}
+
 with tab_demand:
     st.subheader("Check current demand interest for any item")
-    d_col1, d_col2 = st.columns(2)
+    d_col1, d_col2, d_col3 = st.columns(3)
     with d_col1:
         item_query = st.text_input("Item", placeholder="e.g. coffee")
     with d_col2:
         geo_query = st.text_input("Geo code (2-letter, or blank for worldwide)", placeholder="e.g. US")
+    with d_col3:
+        horizon_label = st.selectbox("Trend horizon (whole period fetched)", list(HORIZON_OPTIONS.keys()))
 
     if st.button("Check demand"):
         try:
-            df = cached_interest_over_time(item_query, geo_query)
+            df = cached_interest_over_time(item_query, geo_query, HORIZON_OPTIONS[horizon_label])
         except ValueError as e:
             st.error(str(e))
         else:
-            spike = detect_spike(df, item_query)
-            summary = summarize_interest(item_query, geo_query or "worldwide", spike)
-            st.write(summary)
+            # Persisted in session_state (not just a local var) so the sub-period
+            # picker below still has this data after the rerun that widget causes.
+            st.session_state["demand_last_df"] = df
+            st.session_state["demand_last_item"] = item_query
+            st.session_state["demand_last_geo"] = geo_query
 
-            chart_df = df.reset_index()
-            date_col, value_col = chart_df.columns[0], chart_df.columns[1]
-            chart = (
-                alt.Chart(chart_df)
-                .mark_line()
-                .encode(
-                    x=alt.X(f"{date_col}:T", title="Date", axis=alt.Axis(format="%b %d", labelAngle=-45)),
-                    y=alt.Y(f"{value_col}:Q", title="Interest (0-100)"),
-                    tooltip=[
-                        alt.Tooltip(f"{date_col}:T", title="Date", format="%b %d, %Y"),
-                        alt.Tooltip(f"{value_col}:Q", title="Interest"),
-                    ],
-                )
-                .properties(height=350)
+    if "demand_last_df" in st.session_state:
+        df = st.session_state["demand_last_df"]
+        persisted_item = st.session_state["demand_last_item"]
+        persisted_geo = st.session_state["demand_last_geo"]
+
+        spike = detect_spike(df, persisted_item)
+        summary = summarize_interest(persisted_item, persisted_geo or "worldwide", spike)
+        st.write(summary)
+
+        chart_df = df.reset_index()
+        date_col, value_col = chart_df.columns[0], chart_df.columns[1]
+        chart = (
+            alt.Chart(chart_df)
+            .mark_line()
+            .encode(
+                x=alt.X(f"{date_col}:T", title="Date", axis=alt.Axis(format="%b %d", labelAngle=-45)),
+                y=alt.Y(f"{value_col}:Q", title="Interest (0-100)"),
+                tooltip=[
+                    alt.Tooltip(f"{date_col}:T", title="Date", format="%b %d, %Y"),
+                    alt.Tooltip(f"{value_col}:Q", title="Interest"),
+                ],
             )
-            st.altair_chart(chart, use_container_width=True)
+            .properties(height=350)
+        )
+        st.altair_chart(chart, use_container_width=True)
 
-            if spike["is_significant"]:
-                st.caption("Checking for news around that spike (correlation, not confirmed cause)...")
-                try:
-                    articles = cached_related_news(item_query, spike["peak_date"])
-                except RuntimeError as e:
-                    st.warning(f"News search failed ({e}) — this is NOT the same as 'no news'.")
+        if spike["is_significant"]:
+            st.caption("Checking for news around that spike (correlation, not confirmed cause)...")
+            try:
+                articles = cached_related_news(persisted_item, spike["peak_date"])
+            except RuntimeError as e:
+                st.warning(f"News search failed ({e}) — this is NOT the same as 'no news'.")
+            else:
+                if articles:
+                    subject = f"'{persisted_item}' search demand in {persisted_geo or 'worldwide'}"
+                    render_articles(articles, key=f"demand_{persisted_item}_{persisted_geo}", subject=subject, context_lines=[summary])
                 else:
-                    if articles:
-                        subject = f"'{item_query}' search demand in {geo_query or 'worldwide'}"
-                        render_articles(articles, key=f"demand_{item_query}_{geo_query}", subject=subject, context_lines=[summary])
-                    else:
-                        st.info(
-                            "No related news found. This spike may just be routine "
-                            "weekly/seasonal variation rather than a specific event."
-                        )
+                    st.info(
+                        "No related news found. This spike may just be routine "
+                        "weekly/seasonal variation rather than a specific event."
+                    )
+
+        st.divider()
+        st.markdown("**Analyze a specific period within this horizon**")
+        min_date, max_date = df.index.min().date(), df.index.max().date()
+        period_range = st.date_input(
+            "Select a sub-period to see its own relative rise/fall",
+            value=(min_date, max_date), min_value=min_date, max_value=max_date,
+            key="demand_subperiod",
+        )
+        if isinstance(period_range, tuple) and len(period_range) == 2:
+            sub_start, sub_end = period_range
+            if (sub_start, sub_end) != (min_date, max_date):
+                sub_df = df.loc[str(sub_start):str(sub_end)]
+                if len(sub_df) >= 2:
+                    sub_spike = detect_spike(sub_df, persisted_item)
+                    sub_summary = summarize_interest(persisted_item, persisted_geo or "worldwide", sub_spike)
+                    st.info(f"**Within {sub_start} to {sub_end}:** {sub_summary}")
+                else:
+                    st.caption("Selected period is too short to analyze (need at least 2 data points in range).")
 
 # --- Tab 3: Disruption Scan ---
 with tab_disruption:

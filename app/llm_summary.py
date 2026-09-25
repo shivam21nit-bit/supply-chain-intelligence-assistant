@@ -22,7 +22,12 @@ from google.genai import errors as genai_errors
 
 load_dotenv()
 
+# Primary, then a fallback model (verified working for this account) if the
+# primary is overloaded — separate models draw from separate free-tier
+# capacity pools, so a fallback genuinely improves reliability here rather
+# than just retrying the same congested pool twice.
 MODEL = "gemini-3.8-flash"
+FALLBACK_MODEL = "gemini-flash-lite-latest"
 
 # The SDK already retries transient errors internally, but its own retry
 # window is too short for Gemini free-tier "high demand" 503s, which can
@@ -71,22 +76,34 @@ def summarize_cause(subject: str, context_lines: list[str], articles: list[dict]
     )
 
     client = genai.Client(api_key=api_key)
+    errors_by_model = {}
+    for model in (MODEL, FALLBACK_MODEL):
+        try:
+            return _call_model(client, model, prompt)
+        except RuntimeError as e:
+            errors_by_model[model] = str(e)
+
+    detail = "; ".join(f"{m}: {e}" for m, e in errors_by_model.items())
+    raise RuntimeError(f"All models overloaded/failed — {detail}")
+
+
+def _call_model(client: "genai.Client", model: str, prompt: str) -> str:
     last_error = None
     for attempt in range(RETRY_ATTEMPTS):
         try:
-            response = client.models.generate_content(model=MODEL, contents=prompt)
+            response = client.models.generate_content(model=model, contents=prompt)
         except genai_errors.ServerError as e:
-            last_error = f"Gemini overloaded ({e.__class__.__name__}): {e}"
+            last_error = f"overloaded ({e.__class__.__name__}): {e}"
             time.sleep(RETRY_BACKOFF_SECONDS)
             continue
         except genai_errors.APIError as e:
-            raise RuntimeError(f"Gemini API call failed ({e.__class__.__name__}): {e}")
+            raise RuntimeError(f"API call failed ({e.__class__.__name__}): {e}")
 
         if not response.text:
-            last_error = "Gemini returned an empty response."
+            last_error = "returned an empty response"
             time.sleep(RETRY_BACKOFF_SECONDS)
             continue
 
         return response.text.strip()
 
-    raise RuntimeError(f"{last_error} Gave up after {RETRY_ATTEMPTS} attempts.")
+    raise RuntimeError(f"{last_error} (gave up after {RETRY_ATTEMPTS} attempts)")

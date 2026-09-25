@@ -60,8 +60,14 @@ def summarize_interest(keyword: str, geo_label: str, spike: dict) -> str:
         spike_note = f" It spiked to {peak_value} {when}, around {peak_date_str}."
 
     if first_value == 0:
-        trend = f"has risen to {last_value}" if last_value > 0 else "has stayed near zero"
-        return f"Interest in '{keyword}' in {geo_label} {trend} {period}.{spike_note}"
+        # Percent change is mathematically undefined from a zero base, so
+        # report the absolute point change instead of silently omitting
+        # both the percent AND the scale, which was a real gap here.
+        trend = (
+            f"has risen from 0 to {last_value} points" if last_value > 0
+            else "has stayed near zero"
+        )
+        return f"Interest in '{keyword}' in {geo_label} {trend} (Google's 0-100 scale) {period}.{spike_note}"
 
     pct_change = (last_value - first_value) / first_value * 100
     direction = "up" if pct_change > 0 else "down" if pct_change < 0 else "flat"
