@@ -123,6 +123,5 @@ Real, current constraints worth knowing before you rely on this for anything:
   the exact week-by-week split. Capacity is also flat per lane (not
   week-varying) and the stockout penalty is one global number, not
   per-item — both are stated simplifications matching the data available
-  today, not silent assumptions.
-- 
+  today, not silent assumptions. 
 - The optimizer's solver used - (Google OR-Tools/GLOP).
