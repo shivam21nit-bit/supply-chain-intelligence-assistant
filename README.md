@@ -124,12 +124,5 @@ Real, current constraints worth knowing before you rely on this for anything:
   week-varying) and the stockout penalty is one global number, not
   per-item — both are stated simplifications matching the data available
   today, not silent assumptions.
-- The AI summary feature (Gemini, free tier) is explicitly instructed to
-  never state a price/delay figure that isn't literally present in the
-  data it's given, and to say plainly when the evidence doesn't explain
-  something — but free-tier model availability shifts over time; if a
-  model name breaks, the API's own error message names the replacement.
-- The optimizer's solver (Google OR-Tools/GLOP) is the right choice for
-  the current pure-continuous-LP model; adding minimum order quantities or
-  lane-activation fixed costs later would call for OR-Tools' CP-SAT solver
-  instead — a real change, not a config flag.
+- 
+- The optimizer's solver used - (Google OR-Tools/GLOP).
